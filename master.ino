@@ -32,6 +32,8 @@ struct GpiMessage {
 
 GpiMessage message = {0, 0};
 uint8_t lastMask = 0;
+unsigned long lastSendTime = 0;
+const unsigned long HEARTBEAT_MS = 2000;
 
 void getMacString(char *buffer, size_t len) {
   uint8_t mac[6];
@@ -144,16 +146,25 @@ void setup() {
 
   lastMask = readInputs();
   sendMaskToSlaves(lastMask);
+  lastSendTime = millis();
   showStatus(lastMask, "INITIAL");
 }
 
 void loop() {
   uint8_t currentMask = readInputs();
+  unsigned long now = millis();
+
   if (currentMask != lastMask) {
     lastMask = currentMask;
     sendMaskToSlaves(currentMask);
+    lastSendTime = now;
     showStatus(currentMask, "CHANGED");
     Serial.printf("Mask=%02X\n", currentMask);
+  } else if (now - lastSendTime >= HEARTBEAT_MS) {
+    sendMaskToSlaves(currentMask);
+    lastSendTime = now;
+    Serial.println("Heartbeat sent");
   }
+
   delay(50);
 }
