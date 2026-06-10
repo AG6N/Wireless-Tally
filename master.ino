@@ -1,56 +1,37 @@
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <esp_mac.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ESP32-S3 N16R8 Master Module
-// Master reads 4 GPI inputs and sends the 4-bit state to 4 slave modules over ESP-NOW.
-// Each slave mirrors the state onto 4 GPO outputs.
-//
-// GPIO pinout examples (change pins as needed for your module):
-//   OLED SDA -> GPIO 8
-//   OLED SCL -> GPIO 9
-//   GPI1      -> GPIO 4
-//   GPI2      -> GPIO 5
-//   GPI3      -> GPIO 13
-//   GPI4      -> GPIO 14
-//
-// If your inputs are momentary pushbuttons, use INPUT_PULLUP and active-low wiring.
-// If you wire sensors that are active-high, set GPI_ACTIVE_LOW to false.
-
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
+#define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 const int NUM_CHANNELS = 4;
 const int MASTER_GPI_PINS[NUM_CHANNELS] = {4, 5, 13, 14};
-const bool GPI_ACTIVE_LOW = true;   // true for INPUT_PULLUP + active-low buttons
-
+const bool GPI_ACTIVE_LOW = true;
 const int OLED_SDA = 8;
 const int OLED_SCL = 9;
 const uint8_t OLED_ADDRESS = 0x3C;
 
-// Replace these with the actual MAC addresses of your 4 slave modules.
 uint8_t slaveMacs[4][6] = {
-  {0xE0, 0x72, 0xA1, 0xD6, 0x79, 0x34},
-  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x02},
-  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x03},
-  {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x04}
+  {0xA0, 0xF2, 0x62, 0xF5, 0x60, 0x8C},
+  {0xA0, 0xF2, 0x62, 0xF4, 0x28, 0xB0},
+  {0xA0, 0xF2, 0x62, 0xF4, 0x67, 0xE4},
+  {0xA0, 0xF2, 0x62, 0xEE, 0xDC, 0x44}
 };
 
 struct GpiMessage {
-  uint8_t mask;       // bit0..bit3 correspond to channels 1..4
-  uint32_t counter;   // packet counter for duplicate suppression
-  uint32_t timestamp; // millis() at send time
+  uint8_t mask;
+  uint32_t counter;
 };
 
-GpiMessage message = {0, 0, 0};
+GpiMessage message = {0, 0};
 uint8_t lastMask = 0;
-unsigned long lastTransmit = 0;
-const unsigned long PERIODIC_SEND_MS = 10000;
 
 void getMacString(char *buffer, size_t len) {
   uint8_t mac[6];
@@ -62,16 +43,17 @@ void getMacString(char *buffer, size_t len) {
 void initOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-    Serial.println("SSD1306 allocation failed");
+    Serial.println("SSD1306 init failed");
     return;
   }
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("FOX 1440 STAGE B TX");
-  display.println("Waiting for changes...");
-  
+  display.println("Waiting for input...");
+
   char macStr[18];
   getMacString(macStr, sizeof(macStr));
   display.setCursor(0, 56);
@@ -91,17 +73,13 @@ uint8_t readInputs() {
   return mask;
 }
 
-void formatMask(uint8_t mask, char *buffer, size_t len) {
-  snprintf(buffer, len, "%c %c %c %c",
+void showStatus(uint8_t mask, const char *note) {
+  char bits[16];
+  snprintf(bits, sizeof(bits), "%c %c %c %c",
            (mask & 0x01) ? '1' : '0',
            (mask & 0x02) ? '1' : '0',
            (mask & 0x04) ? '1' : '0',
            (mask & 0x08) ? '1' : '0');
-}
-
-void updateDisplay(uint8_t mask, const char *note, const char *sendStatus = "") {
-  char bits[16];
-  formatMask(mask, bits, sizeof(bits));
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -111,11 +89,7 @@ void updateDisplay(uint8_t mask, const char *note, const char *sendStatus = "") 
   display.println(bits);
   display.print("Note: ");
   display.println(note);
-  if (sendStatus[0] != '\0') {
-    display.print("Send: ");
-    display.println(sendStatus);
-  }
-  
+
   char macStr[18];
   getMacString(macStr, sizeof(macStr));
   display.setCursor(0, 56);
@@ -124,19 +98,17 @@ void updateDisplay(uint8_t mask, const char *note, const char *sendStatus = "") 
 }
 
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  Serial.printf("Sent status=%s\n",
+  Serial.printf("ESP-NOW send %s\n",
                 status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
-void sendMaskToAll(uint8_t mask) {
+void sendMaskToSlaves(uint8_t mask) {
   message.mask = mask;
   message.counter++;
-  message.timestamp = millis();
-
   for (int i = 0; i < 4; i++) {
-    esp_err_t result = esp_now_send(slaveMacs[i], (uint8_t *)&message, sizeof(message));
-    if (result != ESP_OK) {
-      Serial.printf("Send fail idx=%d err=%d\n", i, result);
+    esp_err_t err = esp_now_send(slaveMacs[i], (uint8_t *)&message, sizeof(message));
+    if (err != ESP_OK) {
+      Serial.printf("Send to slave %d failed %d\n", i, err);
     }
   }
 }
@@ -151,50 +123,37 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    updateDisplay(0, "ESP-NOW init failed");
+    Serial.println("ESP-NOW init failed");
+    showStatus(0, "ESP-NOW failed");
     return;
   }
   esp_now_register_send_cb(onDataSent);
 
   for (int i = 0; i < 4; i++) {
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, slaveMacs[i], 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.printf("Failed to add peer %d\n", i);
-      updateDisplay(0, "Peer add failed");
-    }
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, slaveMacs[i], 6);
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = 1;
+    peer.encrypt = false;
+    esp_err_t err = esp_now_add_peer(&peer);
+    Serial.printf("Add peer %d result=%d\n", i, err);
   }
 
   lastMask = readInputs();
-  sendMaskToAll(lastMask);
-  updateDisplay(lastMask, "Sent initial", "OK");
-  lastTransmit = millis();
+  sendMaskToSlaves(lastMask);
+  showStatus(lastMask, "INITIAL");
 }
 
 void loop() {
-  static uint8_t stableMask = lastMask;
   uint8_t currentMask = readInputs();
-
-  if (currentMask != stableMask) {
-    stableMask = currentMask;
+  if (currentMask != lastMask) {
     lastMask = currentMask;
-    sendMaskToAll(currentMask);
-    updateDisplay(currentMask, "CHANGED", "OK");
-    Serial.printf("Changed to %02X\n", currentMask);
-    lastTransmit = millis();
-  } else {
-    unsigned long now = millis();
-    if (now - lastTransmit >= PERIODIC_SEND_MS) {
-      sendMaskToAll(currentMask);
-      updateDisplay(currentMask, "PERIODIC", "OK");
-      lastTransmit = now;
-    }
+    sendMaskToSlaves(currentMask);
+    showStatus(currentMask, "CHANGED");
+    Serial.printf("Mask=%02X\n", currentMask);
   }
-
   delay(50);
 }
